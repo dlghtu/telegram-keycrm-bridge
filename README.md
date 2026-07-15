@@ -10,11 +10,18 @@
 
 Покрокова інструкція: **[KEYCRM_SETUP.md](./KEYCRM_SETUP.md)**
 
-## Що робить цей сервіс (опційно)
+## Як прибрати «ручне перебирання» даних
 
-`POST /webhooks/keycrm` — якщо CRM шле webhook про появу `tracking_code`, сервіс може написати клієнту в Telegram «Ваш заказ оформлен. ТТН: …».
+Менеджер **не** переносить ПІБ/телефон/відділення з чату в CRM руками.
 
-**Не** став Telegram `setWebhook` на цей сервіс — чати в KeyCRM перестануть приходити.
+1. У чаті KeyCRM надсилає клієнту:  
+   `https://telegram-keycrm-bridge.onrender.com/order?chat_id=TELEGRAM_ID`
+2. Клієнт заповнює форму сам → `POST /api/orders` створює замовлення в KeyCRM.
+3. Менеджер лише перевіряє й тисне **Створити ТТН**.
+
+Опційно: `POST /webhooks/keycrm` — автоповідомлення з ТТН.
+
+**Не** став Telegram `setWebhook` на цей сервіс — чати в KeyCRM зламаються.
 
 ## Deploy (Render)
 
