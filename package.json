@@ -1,7 +1,7 @@
 {
   "name": "telegram-keycrm-bridge",
   "version": "1.0.0",
-  "description": "Микросервис: Telegram ↔ KeyCRM ↔ уведомления с ТТН (Нова Пошта)",
+  "description": "KeyCRM companion: optional TTN Telegram notify. Chats/orders/TTN live in KeyCRM.",
   "main": "app.js",
   "type": "commonjs",
   "scripts": {
