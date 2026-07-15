@@ -1,0 +1,19 @@
+{
+  "name": "telegram-keycrm-bridge",
+  "version": "1.0.0",
+  "description": "Микросервис: Telegram ↔ KeyCRM ↔ уведомления с ТТН (Нова Пошта)",
+  "main": "app.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "node --watch app.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "node-fetch": "^2.7.0"
+  }
+}
