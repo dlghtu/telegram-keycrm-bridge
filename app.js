@@ -1,15 +1,13 @@
 /**
- * KeyCRM companion
+ * KeyCRM companion — менеджер вносить дані 1 раз, клієнт майже нічого не заповнює.
  *
- * Проблема «вручну переносити дані» вирішується так:
- *  1) Менеджер у чаті KeyCRM кидає клієнту посилання на форму:
- *       https://YOUR.onrender.com/order?chat_id=TELEGRAM_CHAT_ID
- *  2) Клієнт сам заповнює ПІБ, телефон, місто, відділення, товар
- *  3) Сервіс створює замовлення в KeyCRM через API — менеджер НЕ перебиває
- *  4) У CRM: перевірити → «Створити ТТН» → (опційно) webhook шле ТТН клієнту
+ * Потік:
+ *  1) Клієнт спілкується в Telegram → чат у KeyCRM
+ *  2) Менеджер відкриває швидку форму /m (на телефоні/ПК)
+ *  3) За 20–30 сек вбиває те, що вже дізнався з чату → замовлення в KeyCRM
+ *  4) Кнопка «Створити ТТН» у CRM
  *
- * Чати лишаються в KeyCRM (webhook бота на messaging.keycrm.app).
- * Цей сервіс НЕ перехоплює вхідні повідомлення Telegram.
+ * Опційно клієнт лише тапає «Підтверджую» за готовим посиланням (0 полів).
  */
 
 require('dotenv').config();
@@ -32,11 +30,17 @@ const config = {
     ? Number(process.env.KEYCRM_NOVA_POSHTA_SERVICE_ID)
     : 2,
   keycrmWebhookSecret: process.env.KEYCRM_WEBHOOK_SECRET || '',
+  managerSecret:
+    process.env.MANAGER_FORM_SECRET ||
+    process.env.KEYCRM_WEBHOOK_SECRET ||
+    'change_me',
   ordersMapFile: process.env.ORDERS_MAP_FILE || '',
   shopName: process.env.SHOP_NAME || 'Магазин',
 };
 
 const ordersMap = new Map();
+/** draftId → order draft for one-tap client confirm */
+const drafts = new Map();
 
 function loadOrdersMap() {
   if (!config.ordersMapFile) return;
@@ -52,7 +56,7 @@ function loadOrdersMap() {
       });
     }
   } catch (err) {
-    console.error('[orders-map] load:', err.message);
+    console.error('[orders-map]', err.message);
   }
 }
 
@@ -71,7 +75,7 @@ function persistOrdersMap() {
     }
     fs.writeFileSync(full, JSON.stringify(obj, null, 2), 'utf8');
   } catch (err) {
-    console.error('[orders-map] save:', err.message);
+    console.error('[orders-map] save', err.message);
   }
 }
 
@@ -86,6 +90,14 @@ function normalizePhone(phone) {
 
 function phoneDigits(phone) {
   return String(phone || '').replace(/\D/g, '');
+}
+
+function escapeHtml(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 async function httpJson(url, options = {}) {
@@ -147,127 +159,223 @@ async function sendTelegramMessage(chatId, text) {
   }
 }
 
-function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+function requireManager(req, res) {
+  const secret =
+    req.query.secret ||
+    req.headers['x-manager-secret'] ||
+    req.body?.secret ||
+    '';
+  if (secret !== config.managerSecret) {
+    res.status(401).json({ error: 'Невірний secret. Відкрий /m?secret=...' });
+    return false;
+  }
+  return true;
+}
+
+async function createKeyCrmOrder(data) {
+  const fullName = String(data.full_name || '').trim();
+  const phone = normalizePhone(data.phone);
+  const city = String(data.city || '').trim();
+  const warehouse = String(data.warehouse || '').trim();
+  const productName = String(data.product_name || data.name || '').trim();
+  const sku = String(data.sku || '').trim() || `MANUAL-${Date.now()}`;
+  const quantity = Math.max(1, Number(data.quantity) || 1);
+  const price = Number(data.price);
+  const comment = String(data.comment || '').trim();
+  const chatId = String(data.chat_id || data.chatId || '').trim();
+
+  if (!fullName || !phone || !city || !warehouse || !productName) {
+    const err = new Error('Потрібні: ПІБ, телефон, місто, відділення, товар');
+    err.status = 400;
+    throw err;
+  }
+  if (!Number.isFinite(price) || price < 0) {
+    const err = new Error('Невірна ціна');
+    err.status = 400;
+    throw err;
+  }
+  if (!config.keycrmToken) {
+    const err = new Error('KEYCRM_API_TOKEN не задано');
+    err.status = 500;
+    throw err;
+  }
+
+  const payload = {
+    source_id: config.keycrmSourceId,
+    source_uuid: `mgr-${chatId || phoneDigits(phone)}-${Date.now()}`,
+    buyer_comment: comment || undefined,
+    manager_comment: [
+      chatId ? `tg_chat_id:${chatId}` : null,
+      'Швидке замовлення менеджера',
+      `Місто: ${city}`,
+      `НП: ${warehouse}`,
+    ]
+      .filter(Boolean)
+      .join('\n'),
+    buyer: { full_name: fullName, phone },
+    shipping: {
+      delivery_service_id: config.keycrmNovaPoshtaServiceId || undefined,
+      shipping_service: 'Nova Poshta',
+      shipping_address_city: city,
+      shipping_address_country: 'UA',
+      shipping_receive_point: warehouse,
+      recipient_full_name: fullName,
+      recipient_phone: phone,
+    },
+    products: [{ sku, name: productName, quantity, price, comment: comment || undefined }],
+  };
+
+  const created = await keycrmPost('/order', payload);
+  const orderId = created?.id ?? created?.data?.id ?? null;
+
+  if (orderId != null && chatId) {
+    ordersMap.set(String(orderId), { chatId, phone, notifiedTtns: new Set() });
+    persistOrdersMap();
+  }
+
+  return { orderId, payload, chatId };
 }
 
 // ---------------------------------------------------------------------------
-// Order form HTML (клієнт заповнює сам → API KeyCRM)
+// HTML: manager form (primary) + client confirm (one tap)
 // ---------------------------------------------------------------------------
 
-function orderFormPage({ chatId = '', prefill = {} } = {}) {
-  const shop = escapeHtml(config.shopName);
-  const cid = escapeHtml(chatId || '');
+const CSS = `
+:root { --bg:#0f1419; --card:#1a2332; --text:#e7ecf3; --muted:#8b9bb4; --acc:#3d8bfd; --ok:#3dd68c; --err:#ff6b6b; }
+* { box-sizing:border-box; }
+body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--text); }
+.wrap { max-width:440px; margin:0 auto; padding:16px 14px 36px; }
+h1 { font-size:1.2rem; margin:0 0 4px; }
+.sub { color:var(--muted); font-size:.88rem; margin:0 0 14px; line-height:1.4; }
+.card { background:var(--card); border:1px solid #243044; border-radius:14px; padding:14px; }
+label { display:block; font-size:.72rem; color:var(--muted); margin:10px 0 4px; text-transform:uppercase; letter-spacing:.03em; }
+input, textarea { width:100%; padding:11px 12px; border-radius:10px; border:1px solid #2a3548; background:#121a26; color:var(--text); font-size:16px; }
+.row { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+button, .btn { display:block; width:100%; margin-top:12px; padding:13px; border:0; border-radius:12px; background:var(--acc); color:#fff; font-weight:600; font-size:.95rem; cursor:pointer; text-align:center; text-decoration:none; }
+button.sec { background:#2a3548; margin-top:8px; }
+button:disabled { opacity:.55; }
+.msg { margin-top:12px; padding:10px 12px; border-radius:10px; display:none; font-size:.9rem; line-height:1.4; word-break:break-word; }
+.msg.ok { display:block; background:rgba(61,214,140,.12); color:var(--ok); }
+.msg.err { display:block; background:rgba(255,107,107,.12); color:var(--err); }
+.big { font-size:1.05rem; line-height:1.5; margin:12px 0; }
+.muted { color:var(--muted); }
+`;
+
+function managerPage(secret) {
+  const s = escapeHtml(secret);
   return `<!DOCTYPE html>
-<html lang="uk">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-  <title>Оформлення замовлення — ${shop}</title>
-  <style>
-    :root { --bg:#0f1419; --card:#1a2332; --text:#e7ecf3; --muted:#8b9bb4; --acc:#3d8bfd; --ok:#3dd68c; --err:#ff6b6b; }
-    * { box-sizing: border-box; }
-    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--text); min-height:100vh; }
-    .wrap { max-width:480px; margin:0 auto; padding:20px 16px 40px; }
-    h1 { font-size:1.35rem; margin:0 0 6px; }
-    p.sub { color:var(--muted); margin:0 0 20px; font-size:.95rem; line-height:1.4; }
-    label { display:block; font-size:.8rem; color:var(--muted); margin:14px 0 6px; }
-    input, textarea, select { width:100%; padding:12px 14px; border-radius:10px; border:1px solid #2a3548; background:#121a26; color:var(--text); font-size:16px; }
-    input:focus, textarea:focus { outline:2px solid var(--acc); border-color:transparent; }
-    .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
-    button { width:100%; margin-top:22px; padding:14px; border:0; border-radius:12px; background:var(--acc); color:#fff; font-weight:600; font-size:1rem; cursor:pointer; }
-    button:disabled { opacity:.55; cursor:wait; }
-    .msg { margin-top:16px; padding:12px 14px; border-radius:10px; display:none; line-height:1.45; }
-    .msg.ok { display:block; background:rgba(61,214,140,.12); color:var(--ok); border:1px solid rgba(61,214,140,.35); }
-    .msg.err { display:block; background:rgba(255,107,107,.12); color:var(--err); border:1px solid rgba(255,107,107,.35); }
-    .hint { font-size:.75rem; color:var(--muted); margin-top:4px; }
-    .card { background:var(--card); border-radius:16px; padding:18px 16px 22px; border:1px solid #243044; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <h1>📦 Оформлення замовлення</h1>
-    <p class="sub">${shop}. Заповніть дані один раз — менеджер отримає їх у CRM і створить ТТН.</p>
-    <div class="card">
-      <form id="f" autocomplete="on">
-        <input type="hidden" name="chat_id" value="${cid}" />
-
-        <label>ПІБ отримувача *</label>
-        <input name="full_name" required placeholder="Іван Петренко" value="${escapeHtml(prefill.full_name || '')}" />
-
-        <label>Телефон *</label>
-        <input name="phone" required type="tel" inputmode="tel" placeholder="+380501112233" value="${escapeHtml(prefill.phone || '')}" />
-
-        <label>Місто *</label>
-        <input name="city" required placeholder="Київ" value="${escapeHtml(prefill.city || '')}" />
-
-        <label>Відділення / поштомат Нової Пошти *</label>
-        <input name="warehouse" required placeholder="Відділення №5, вул. …" value="${escapeHtml(prefill.warehouse || '')}" />
-
-        <label>Товар (назва) *</label>
-        <input name="product_name" required placeholder="Футболка чорна M" value="${escapeHtml(prefill.product_name || '')}" />
-
-        <label>Артикул SKU (якщо знаєте)</label>
-        <input name="sku" placeholder="TSHIRT-M" value="${escapeHtml(prefill.sku || '')}" />
-        <p class="hint">Якщо SKU збігається з каталогом KeyCRM — спишуться залишки. Інакше менеджер підправить у CRM.</p>
-
-        <div class="row">
-          <div>
-            <label>Кількість *</label>
-            <input name="quantity" type="number" min="1" step="1" value="${escapeHtml(String(prefill.quantity || '1'))}" required />
-          </div>
-          <div>
-            <label>Ціна, грн *</label>
-            <input name="price" type="number" min="0" step="0.01" value="${escapeHtml(String(prefill.price || ''))}" required placeholder="450" />
-          </div>
-        </div>
-
-        <label>Коментар</label>
-        <textarea name="comment" rows="2" placeholder="Колір, розмір, побажання…">${escapeHtml(prefill.comment || '')}</textarea>
-
-        <button type="submit" id="btn">Надіслати замовлення</button>
-        <div id="msg" class="msg"></div>
-      </form>
-    </div>
+<html lang="uk"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
+<title>Швидке замовлення</title><style>${CSS}</style>
+</head><body><div class="wrap">
+<h1>⚡ Швидке замовлення</h1>
+<p class="sub">Клієнт лише спілкується в чаті. Ти вбиваєш дані <b>один раз</b> сюди → одразу KeyCRM. Без форм для клієнта.</p>
+<div class="card">
+<form id="f">
+  <input type="hidden" name="secret" value="${s}"/>
+  <label>ПІБ</label>
+  <input name="full_name" required placeholder="Іван Петренко" autocomplete="name"/>
+  <label>Телефон</label>
+  <input name="phone" required type="tel" placeholder="0501112233" inputmode="tel"/>
+  <div class="row">
+    <div><label>Місто</label><input name="city" required placeholder="Київ"/></div>
+    <div><label>Відд. НП</label><input name="warehouse" required placeholder="№5 / адреса"/></div>
   </div>
-  <script>
-    const form = document.getElementById('f');
-    const btn = document.getElementById('btn');
-    const msg = document.getElementById('msg');
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      msg.className = 'msg';
-      msg.textContent = '';
-      btn.disabled = true;
-      btn.textContent = 'Надсилаємо…';
-      const data = Object.fromEntries(new FormData(form).entries());
-      try {
-        const res = await fetch('/api/orders', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(data),
-        });
-        const json = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(json.error || ('Помилка ' + res.status));
-        msg.className = 'msg ok';
-        msg.innerHTML = '✅ Замовлення прийнято' + (json.orderId ? ' (№ <b>' + json.orderId + '</b>)' : '') +
-          '.<br>Менеджер підтвердить і відправить ТТН у цей чат.';
-        form.querySelectorAll('input:not([type=hidden]),textarea').forEach(el => { if (el.name !== 'quantity') el.value = el.name === 'quantity' ? '1' : ''; });
-      } catch (err) {
-        msg.className = 'msg err';
-        msg.textContent = '❌ ' + (err.message || 'Не вдалося надіслати');
-      } finally {
-        btn.disabled = false;
-        btn.textContent = 'Надіслати замовлення';
-      }
-    });
-  </script>
-</body>
-</html>`;
+  <label>Товар</label>
+  <input name="product_name" required placeholder="Футболка M чорна"/>
+  <div class="row">
+    <div><label>SKU</label><input name="sku" placeholder="опційно"/></div>
+    <div><label>К-сть</label><input name="quantity" type="number" min="1" value="1"/></div>
+  </div>
+  <label>Ціна, грн</label>
+  <input name="price" required type="number" min="0" step="1" placeholder="450" inputmode="numeric"/>
+  <label>Telegram chat_id клієнта (для ТТН пізніше)</label>
+  <input name="chat_id" placeholder="не обовʼязково" inputmode="numeric"/>
+  <label>Коментар</label>
+  <input name="comment" placeholder="розмір, колір…"/>
+  <button type="submit" id="btn">Створити в KeyCRM</button>
+  <button type="button" class="sec" id="btnDraft">Лише посилання «Підтвердити» клієнту</button>
+  <div id="msg" class="msg"></div>
+</form>
+</div>
+</div>
+<script>
+const form=document.getElementById('f');
+const msg=document.getElementById('msg');
+const btn=document.getElementById('btn');
+function data(){return Object.fromEntries(new FormData(form).entries());}
+function show(ok,t){msg.className='msg '+(ok?'ok':'err');msg.innerHTML=t;}
+form.addEventListener('submit',async e=>{
+  e.preventDefault(); btn.disabled=true; btn.textContent='Створюємо…';
+  try{
+    const r=await fetch('/api/orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...data(), mode:'create'})});
+    const j=await r.json();
+    if(!r.ok) throw new Error(j.error||r.status);
+    show(true,'✅ Замовлення в KeyCRM'+(j.orderId?' № <b>'+j.orderId+'</b>':'')+'. Відкрий CRM → Створити ТТН.');
+  }catch(err){show(false,'❌ '+(err.message||'помилка'));}
+  finally{btn.disabled=false;btn.textContent='Створити в KeyCRM';}
+});
+document.getElementById('btnDraft').onclick=async()=>{
+  try{
+    const r=await fetch('/api/orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...data(), mode:'draft'})});
+    const j=await r.json();
+    if(!r.ok) throw new Error(j.error||r.status);
+    show(true,'Посилання клієнту (1 тап, без полів):<br><a style="color:#7eb6ff" href="'+j.confirm_url+'">'+j.confirm_url+'</a><br>Кинь у чат KeyCRM.');
+  }catch(err){show(false,'❌ '+(err.message||'помилка'));}
+};
+</script>
+</body></html>`;
+}
+
+function confirmPage(draft) {
+  const d = draft;
+  return `<!DOCTYPE html>
+<html lang="uk"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Підтвердження</title><style>${CSS}</style>
+</head><body><div class="wrap">
+<h1>Підтвердіть замовлення</h1>
+<p class="sub">Нічого вводити не потрібно — лише перевірте і натисніть кнопку.</p>
+<div class="card">
+  <div class="big">
+    <div><b>${escapeHtml(d.product_name)}</b> × ${escapeHtml(d.quantity)} — ${escapeHtml(d.price)} грн</div>
+    <div class="muted" style="margin-top:10px">${escapeHtml(d.full_name)}</div>
+    <div class="muted">${escapeHtml(d.phone)}</div>
+    <div class="muted">${escapeHtml(d.city)}, ${escapeHtml(d.warehouse)}</div>
+  </div>
+  <button type="button" id="ok">Так, усе вірно</button>
+  <p class="sub" style="margin-top:12px">Якщо помилка — просто напишіть менеджеру в чат.</p>
+  <div id="msg" class="msg"></div>
+</div>
+</div>
+<script>
+document.getElementById('ok').onclick=async()=>{
+  const btn=document.getElementById('ok'); const msg=document.getElementById('msg');
+  btn.disabled=true; btn.textContent='…';
+  try{
+    const r=await fetch('/api/confirm/${escapeHtml(d.id)}',{method:'POST'});
+    const j=await r.json();
+    if(!r.ok) throw new Error(j.error||r.status);
+    msg.className='msg ok'; msg.textContent='✅ Готово! Менеджер оформить відправку.';
+    btn.style.display='none';
+  }catch(e){ msg.className='msg err'; msg.textContent='❌ '+(e.message||'помилка'); btn.disabled=false; btn.textContent='Так, усе вірно'; }
+};
+</script>
+</body></html>`;
+}
+
+function loginPage() {
+  return `<!DOCTYPE html><html lang="uk"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Вхід</title><style>${CSS}</style></head><body><div class="wrap">
+<h1>Менеджер</h1>
+<p class="sub">Встав secret з Render (MANAGER_FORM_SECRET або KEYCRM_WEBHOOK_SECRET).</p>
+<div class="card">
+<form method="get" action="/m">
+<label>Secret</label>
+<input name="secret" required/>
+<button type="submit">Відкрити форму</button>
+</form>
+</div></div></body></html>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -275,181 +383,154 @@ function orderFormPage({ chatId = '', prefill = {} } = {}) {
 // ---------------------------------------------------------------------------
 
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '512kb' }));
 app.use(express.urlencoded({ extended: true }));
 
 app.get('/', (_req, res) => {
   res.json({
     ok: true,
     service: 'keycrm-companion',
-    order_form: '/order',
-    hint: 'Менеджер кидає клієнту /order?chat_id=... — клієнт заповнює сам, замовлення в KeyCRM.',
+    client_does: 'тільки спілкується (опційно 1 тап «Підтверджую»)',
+    manager: '/m?secret=YOUR_SECRET — швидка форма → KeyCRM',
   });
 });
 
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
-/** Форма для клієнта */
-app.get('/order', (req, res) => {
-  res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.send(
-    orderFormPage({
-      chatId: String(req.query.chat_id || req.query.tg || ''),
-      prefill: {
-        full_name: req.query.name || '',
-        phone: req.query.phone || '',
-        product_name: req.query.product || '',
-        sku: req.query.sku || '',
-        price: req.query.price || '',
-      },
-    })
-  );
-});
-
-/** Швидке посилання для менеджера (з chat_id) */
-app.get('/link', (req, res) => {
-  const chatId = String(req.query.chat_id || '').trim();
-  if (!chatId) {
-    return res.status(400).json({
-      error: 'Додайте ?chat_id=TELEGRAM_ID',
-      example: '/link?chat_id=123456789',
-    });
+/** Швидка форма менеджера */
+app.get('/m', (req, res) => {
+  const secret = String(req.query.secret || '');
+  if (!secret) {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.send(loginPage());
   }
-  const base = config.publicBaseUrl || `${req.protocol}://${req.get('host')}`;
-  const url = `${base}/order?chat_id=${encodeURIComponent(chatId)}`;
-  res.json({
-    order_form_url: url,
-    for_manager:
-      'Скопіюй order_form_url і надішли клієнту в чаті KeyCRM. Після заповнення з’явиться замовлення в CRM.',
-  });
+  if (secret !== config.managerSecret) {
+    return res.status(401).send('Невірний secret');
+  }
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(managerPage(secret));
 });
 
-/**
- * Створення замовлення в KeyCRM (з форми клієнта)
- * Списання залишків: передайте реальний sku з каталогу.
- */
-app.post('/api/orders', async (req, res) => {
+/** Стара /order — редірект на пояснення + confirm якщо draft */
+app.get('/order', (req, res) => {
+  if (req.query.d) {
+    return res.redirect(`/c/${encodeURIComponent(req.query.d)}`);
+  }
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(`<!DOCTYPE html><html lang="uk"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Замовлення</title><style>${CSS}</style></head><body><div class="wrap">
+<h1>Замовлення оформлює менеджер</h1>
+<p class="sub">Вам нічого заповнювати. Напишіть менеджеру в чат — він усе зробить. Якщо надіслали посилання «підтвердити» — відкрийте його.</p>
+</div></body></html>`);
+});
+
+/** One-tap confirm for client */
+app.get('/c/:id', (req, res) => {
+  const draft = drafts.get(req.params.id);
+  if (!draft) {
+    res.status(404).setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.send(
+      `<!DOCTYPE html><html lang="uk"><body style="font-family:system-ui;padding:24px;background:#0f1419;color:#e7ecf3">Посилання недійсне або вже використане. Напишіть менеджеру.</body></html>`
+    );
+  }
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(confirmPage({ ...draft, id: req.params.id }));
+});
+
+app.post('/api/confirm/:id', async (req, res) => {
   try {
-    if (!config.keycrmToken) {
-      return res.status(500).json({ error: 'KEYCRM_API_TOKEN не налаштований на сервері' });
-    }
-
-    const body = req.body || {};
-    const fullName = String(body.full_name || '').trim();
-    const phone = normalizePhone(body.phone);
-    const city = String(body.city || '').trim();
-    const warehouse = String(body.warehouse || '').trim();
-    const productName = String(body.product_name || body.name || '').trim();
-    const sku = String(body.sku || '').trim() || `FORM-${Date.now()}`;
-    const quantity = Math.max(1, Number(body.quantity) || 1);
-    const price = Number(body.price);
-    const comment = String(body.comment || '').trim();
-    const chatId = String(body.chat_id || body.chatId || '').trim();
-
-    if (!fullName || !phone || !city || !warehouse || !productName) {
-      return res.status(400).json({ error: 'Заповніть ПІБ, телефон, місто, відділення і товар' });
-    }
-    if (!Number.isFinite(price) || price < 0) {
-      return res.status(400).json({ error: 'Вкажіть коректну ціну' });
-    }
-
-    const payload = {
-      source_id: config.keycrmSourceId,
-      source_uuid: `webform-${chatId || phoneDigits(phone)}-${Date.now()}`,
-      buyer_comment: comment || undefined,
-      manager_comment: [
-        chatId ? `tg_chat_id:${chatId}` : null,
-        'Джерело: веб-форма замовлення (клієнт заповнив сам)',
-        `Місто: ${city}`,
-        `НП: ${warehouse}`,
-      ]
-        .filter(Boolean)
-        .join('\n'),
-      buyer: {
-        full_name: fullName,
-        phone,
-      },
-      shipping: {
-        delivery_service_id: config.keycrmNovaPoshtaServiceId || undefined,
-        shipping_service: 'Nova Poshta',
-        shipping_address_city: city,
-        shipping_address_country: 'UA',
-        shipping_receive_point: warehouse,
-        recipient_full_name: fullName,
-        recipient_phone: phone,
-      },
-      products: [
-        {
-          sku,
-          name: productName,
-          quantity,
-          price,
-          comment: comment || undefined,
-        },
-      ],
-    };
-
-    console.log('[order] create', JSON.stringify(payload));
-    const created = await keycrmPost('/order', payload);
-    const orderId = created?.id ?? created?.data?.id ?? null;
-
-    if (orderId != null && chatId) {
-      ordersMap.set(String(orderId), {
-        chatId,
-        phone,
-        notifiedTtns: new Set(),
-      });
-      persistOrdersMap();
-    }
-
-    // Підтвердження клієнту в Telegram (якщо знаємо chat_id)
+    const draft = drafts.get(req.params.id);
+    if (!draft) return res.status(404).json({ error: 'Посилання недійсне' });
+    const { orderId, chatId } = await createKeyCrmOrder(draft);
+    drafts.delete(req.params.id);
     if (chatId) {
       await sendTelegramMessage(
         chatId,
-        [
-          '✅ <b>Дякуємо!</b> Замовлення прийнято.',
-          orderId != null ? `Номер у CRM: <code>${orderId}</code>` : '',
-          'Менеджер перевірить і надішле ТТН Нової Пошти.',
-        ]
-          .filter(Boolean)
-          .join('\n')
+        `✅ Замовлення підтверджено${orderId != null ? ` (№ ${orderId})` : ''}. Очікуйте ТТН.`
       );
     }
-
-    res.json({ ok: true, orderId, message: 'created' });
+    res.json({ ok: true, orderId });
   } catch (err) {
-    console.error('[order] failed:', err.message, err.body);
-    res.status(502).json({
-      error: 'KeyCRM не прийняла замовлення. Перевірте SKU/API або спробуйте пізніше.',
-      detail: err.message,
-    });
+    console.error('[confirm]', err.message);
+    res.status(err.status || 502).json({ error: err.message });
+  }
+});
+
+app.post('/api/orders', async (req, res) => {
+  try {
+    const body = req.body || {};
+    if (body.secret !== config.managerSecret) {
+      return res.status(401).json({ error: 'Невірний secret' });
+    }
+
+    const mode = body.mode || 'create';
+
+    if (mode === 'draft') {
+      // validate lightly
+      const fullName = String(body.full_name || '').trim();
+      const phone = normalizePhone(body.phone);
+      const city = String(body.city || '').trim();
+      const warehouse = String(body.warehouse || '').trim();
+      const productName = String(body.product_name || '').trim();
+      const price = Number(body.price);
+      if (!fullName || !phone || !city || !warehouse || !productName || !Number.isFinite(price)) {
+        return res.status(400).json({ error: 'Заповніть поля перед створенням посилання' });
+      }
+      const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+      const draft = {
+        full_name: fullName,
+        phone,
+        city,
+        warehouse,
+        product_name: productName,
+        sku: String(body.sku || '').trim(),
+        quantity: Math.max(1, Number(body.quantity) || 1),
+        price,
+        comment: String(body.comment || '').trim(),
+        chat_id: String(body.chat_id || '').trim(),
+        createdAt: Date.now(),
+      };
+      drafts.set(id, draft);
+      // auto-expire 24h
+      setTimeout(() => drafts.delete(id), 24 * 3600 * 1000).unref?.();
+
+      const base = config.publicBaseUrl || `${req.protocol}://${req.get('host')}`;
+      const confirm_url = `${base}/c/${id}`;
+      return res.json({ ok: true, draft_id: id, confirm_url });
+    }
+
+    const { orderId, chatId } = await createKeyCrmOrder(body);
+    if (chatId) {
+      await sendTelegramMessage(
+        chatId,
+        `✅ Замовлення прийнято${orderId != null ? ` (№ ${orderId})` : ''}. Менеджер надішле ТТН.`
+      );
+    }
+    res.json({ ok: true, orderId });
+  } catch (err) {
+    console.error('[order]', err.message, err.body);
+    res.status(err.status || 502).json({ error: err.message || 'KeyCRM error' });
   }
 });
 
 // ---------------------------------------------------------------------------
-// KeyCRM webhook → TTN notify
+// KeyCRM webhook → TTN
 // ---------------------------------------------------------------------------
 
 function extractFromKeyCrmWebhook(body) {
   const root = body?.context || body?.data || body?.order || body || {};
-  const shipping = root.shipping || body?.shipping || root.delivery || {};
+  const shipping = root.shipping || body?.shipping || {};
   const trackingCode =
-    shipping.tracking_code ||
-    shipping.trackingCode ||
-    root.tracking_code ||
-    body?.tracking_code ||
-    null;
-  const orderId =
-    root.id ?? root.order_id ?? body?.order_id ?? body?.id ?? body?.context?.id ?? null;
-  const phone =
-    root.buyer?.phone || shipping.recipient_phone || body?.buyer?.phone || null;
+    shipping.tracking_code || shipping.trackingCode || root.tracking_code || body?.tracking_code;
+  const orderId = root.id ?? root.order_id ?? body?.order_id ?? body?.id ?? body?.context?.id;
+  const phone = root.buyer?.phone || shipping.recipient_phone || body?.buyer?.phone;
   const comment = String(root.manager_comment || body?.manager_comment || '');
-  const chatFromComment = comment.match(/tg_chat_id\s*[:=]\s*(-?\d+)/i);
+  const m = comment.match(/tg_chat_id\s*[:=]\s*(-?\d+)/i);
   return {
     orderId: orderId != null ? String(orderId) : null,
     trackingCode: trackingCode || null,
     phone,
-    chatIdFromComment: chatFromComment ? chatFromComment[1] : null,
+    chatIdFromComment: m ? m[1] : null,
   };
 }
 
@@ -459,32 +540,25 @@ app.post('/webhooks/keycrm', async (req, res) => {
     if (config.keycrmWebhookSecret) {
       const q = req.query.secret;
       const header = req.get('X-Webhook-Secret');
-      if (q !== config.keycrmWebhookSecret && header !== config.keycrmWebhookSecret) {
-        console.warn('[keycrm-webhook] unauthorized');
-        return;
-      }
+      if (q !== config.keycrmWebhookSecret && header !== config.keycrmWebhookSecret) return;
     }
-
     let extracted = extractFromKeyCrmWebhook(req.body || {});
-    let order = null;
-
     if (extracted.orderId && !extracted.trackingCode) {
       try {
-        order = await keycrmGet(
-          `/order/${extracted.orderId}?include=buyer,shipping,custom_fields`
+        const order = await keycrmGet(
+          `/order/${extracted.orderId}?include=buyer,shipping`
         );
         const more = extractFromKeyCrmWebhook(order);
         extracted = {
           ...extracted,
           trackingCode: extracted.trackingCode || more.trackingCode,
-          phone: extracted.phone || more.phone || order?.buyer?.phone,
+          phone: extracted.phone || more.phone,
           chatIdFromComment: extracted.chatIdFromComment || more.chatIdFromComment,
         };
-      } catch (e) {
-        console.error('[keycrm-webhook] fetch order:', e.message);
+      } catch (_) {
+        /* ignore */
       }
     }
-
     if (!extracted.trackingCode) return;
 
     let chatId = extracted.chatIdFromComment;
@@ -500,11 +574,7 @@ app.post('/webhooks/keycrm', async (req, res) => {
         }
       }
     }
-
-    if (!chatId) {
-      console.warn('[keycrm-webhook] no chat_id for', extracted.orderId);
-      return;
-    }
+    if (!chatId) return;
 
     const key = extracted.orderId || `p:${phoneDigits(extracted.phone || '')}`;
     const prev = ordersMap.get(key) || {
@@ -516,23 +586,19 @@ app.post('/webhooks/keycrm', async (req, res) => {
     if (prev.notifiedTtns.has(extracted.trackingCode)) return;
 
     const ttn = extracted.trackingCode;
-    const trackUrl = `https://novaposhta.ua/tracking/?cargo_number=${encodeURIComponent(ttn)}`;
     const sent = await sendTelegramMessage(
       chatId,
       [
         '📦 <b>Ваш заказ оформлен.</b>',
         `ТТН: <code>${escapeHtml(ttn)}</code>`,
-        '',
-        `Відстежити: ${trackUrl}`,
+        `https://novaposhta.ua/tracking/?cargo_number=${encodeURIComponent(ttn)}`,
       ].join('\n')
     );
-
     if (sent) {
       prev.notifiedTtns.add(ttn);
       prev.chatId = chatId;
       ordersMap.set(key, prev);
       persistOrdersMap();
-      console.log('[keycrm-webhook] TTN sent', chatId, ttn);
     }
   } catch (err) {
     console.error('[keycrm-webhook]', err);
@@ -542,8 +608,8 @@ app.post('/webhooks/keycrm', async (req, res) => {
 loadOrdersMap();
 app.listen(config.port, () => {
   console.log(`Listening :${config.port}`);
-  console.log('Order form: /order?chat_id=TELEGRAM_ID');
-  console.log('Do NOT set Telegram bot webhook to this server (KeyCRM owns chats).');
+  console.log('Manager form: /m?secret=...');
+  console.log('Client: only chat + optional one-tap /c/:id');
 });
 
 process.on('unhandledRejection', (r) => console.error(r));
